@@ -218,21 +218,27 @@ class FaceRecognitionTransformer(VideoProcessorBase):
         self.date_today = date_today
         self.detector = MTCNN()
         self.confirm_buf = {}
-        self.period = 1 # Default
+        self.period = 1 
+        self.frame_count = 0  # Added counter for frame skipping
+        self.last_annotated = None # Store last result
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
+        self.frame_count += 1
         
-        # Process the frame using the core recognition logic
-        annotated = process_frame(
-            img, self.gallery, self.detector,
-            f"attendance_{self.date_today}.csv", 
-            set(self.att_log.keys()), 
-            self.date_today, self.period, self.confirm_buf
-        )
+        # Only run recognition every 5 frames
+        if self.frame_count % 5 == 0 or self.last_annotated is None:
+            # Process the frame using the core recognition logic
+            self.last_annotated = process_frame(
+                img, self.gallery, self.detector,
+                f"attendance_{self.date_today}.csv", 
+                set(self.att_log.keys()), 
+                self.date_today, self.period, self.confirm_buf
+            )
         
         from av import VideoFrame
-        return VideoFrame.from_ndarray(annotated, format="bgr24")
+        # Return the annotated frame (or the last one we had to keep video moving)
+        return VideoFrame.from_ndarray(self.last_annotated, format="bgr24")
 
 def _text_frame(msg: str) -> np.ndarray:
     img = np.zeros((240, 480, 3), dtype=np.uint8)

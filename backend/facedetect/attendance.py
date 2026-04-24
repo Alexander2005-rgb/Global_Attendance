@@ -51,8 +51,8 @@ SIM_THRESHOLD          = 0.42        # cosine similarity >= this to accept match
 ALIGN_SIZE             = 112         # ArcFace standard aligned-face size
 
 # ── CCTV / classroom settings ────────────────────────────────────────────────
-# Process full-resolution so small distant faces are not downsampled further
-FRAME_SCALE_FACTOR     = 1.0
+# Scale down slightly for speed on cloud CPU, but keep high enough for distant faces
+FRAME_SCALE_FACTOR     = 0.7
 CONFIRM_FRAMES         = 4           # require 4 consecutive matching frames
 MTCNN_DETECT_CONF      = 0.85        # lower = catch smaller/farther faces
 MTCNN_MIN_FACE         = 30          # minimum face size in pixels (catch distant faces)
