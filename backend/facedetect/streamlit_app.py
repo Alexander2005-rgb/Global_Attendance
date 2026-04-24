@@ -77,7 +77,7 @@ def ss(key, default):
 
 ss("authenticated",    False)
 ss("exam_cell_id",     None)
-ss("gallery",          None)
+ss("gallery",          {})
 ss("cameras",          {})        # {cam_id: {"source": str|int, "name": str}}
 ss("cam_frames",       {})        # {cam_id: np.ndarray}  latest annotated frame
 ss("cam_threads",      {})        # {cam_id: Thread}
@@ -564,15 +564,20 @@ with tab_live:
             info = st.session_state.cameras[cam_id]
             
             if info.get("is_webrtc"):
+                # Capture values for the lambda to avoid session_state access in background threads
+                current_gallery = st.session_state.gallery
+                current_att_log = st.session_state.attendance_log
+                current_date    = st.session_state.date_today
+                
                 with ph:
                     webrtc_streamer(
                         key=cam_id,
                         mode=WebRtcMode.SENDRECV,
                         rtc_configuration=RTC_CONFIG,
                         video_processor_factory=lambda: FaceRecognitionTransformer(
-                            st.session_state.gallery,
-                            st.session_state.attendance_log,
-                            st.session_state.date_today
+                            current_gallery,
+                            current_att_log,
+                            current_date
                         ),
                         async_processing=True,
                     )
