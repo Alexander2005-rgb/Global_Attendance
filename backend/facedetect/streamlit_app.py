@@ -22,6 +22,7 @@ from pathlib import Path
 from datetime import datetime
 from pymongo import MongoClient
 from dotenv import load_dotenv
+import av
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
 
 # ── Core recognition from attendance.py ──────────────────────────────────────
@@ -202,7 +203,13 @@ def camera_worker(cam_id: str, source, gallery: dict,
 
 
 # ── WebRTC Processor for Browser Webcam ─────────────────────────────────────────
-RTC_CONFIG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+RTC_CONFIG = RTCConfiguration(
+    {"iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]}
+    ]}
+)
 
 class FaceRecognitionTransformer(VideoProcessorBase):
     def __init__(self, gallery, att_log, date_today):
