@@ -1,8 +1,8 @@
+opencv-python-headless
 bcrypt
 deepface
 mtcnn
 numpy
-opencv-python
 pymongo
 python-dotenv
 requests
