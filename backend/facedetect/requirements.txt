@@ -1,0 +1,14 @@
+bcrypt
+deepface
+mtcnn
+numpy
+opencv-python
+pymongo
+python-dotenv
+requests
+scikit-learn
+scipy
+streamlit
+tensorflow
+tf-keras
+retina-face
