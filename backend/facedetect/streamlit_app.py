@@ -29,7 +29,7 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfigurati
 from attendance import (
     get_embedding, recognize, passive_liveness,
     update_blink_state, reset_blink, mark_attendance,
-    align_face, clahe_enhance, MTCNN,
+    align_face, clahe_enhance, MTCNN, process_frame,
     MTCNN_DETECT_CONF, MTCNN_MIN_FACE, LIVENESS_ENABLED,
     BLINK_REQUIRED, SIM_THRESHOLD, ENSEMBLE_MODELS,
     BACKEND_API, build_gallery_from_mongo, get_db_students,
