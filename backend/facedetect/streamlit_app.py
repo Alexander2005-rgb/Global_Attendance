@@ -338,16 +338,23 @@ with st.sidebar:
 
         if src_type == "🎥 Local Webcam":
             st.info("Best for local deployment (uses PC camera)")
-            @st.cache_data(show_spinner=False)
-            def scan_webcams():
-                available = []
-                for i in range(5):
-                    cap = cv2.VideoCapture(i)
-                    if cap.isOpened():
-                        available.append(i)
-                        cap.release()
-                return available or [0]
-            available_cams = scan_webcams()
+            
+            # Only scan if not in Cloud
+            if os.getenv("STREAMLIT_SERVER_ADDRESS"):
+                st.warning("Local webcams are usually unavailable in the Cloud. Use 'Browser Webcam' instead.")
+                available_cams = [0]
+            else:
+                @st.cache_data(show_spinner=False)
+                def scan_webcams():
+                    available = []
+                    for i in range(5):
+                        cap = cv2.VideoCapture(i)
+                        if cap.isOpened():
+                            available.append(i)
+                            cap.release()
+                    return available or [0]
+                available_cams = scan_webcams()
+            
             final_source = st.selectbox("Select Webcam", available_cams)
 
         elif src_type == "🌐 Browser Webcam (Cloud)":
