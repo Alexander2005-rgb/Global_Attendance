@@ -67,7 +67,7 @@ BLINK_REQUIRED         = False       # blink detection unusable at CCTV distance
 SCLERA_OPEN_THRESHOLD  = 0.025
 BLINK_WINDOW           = 60
 
-BACKEND_API = 'https://attendance-system-self-gamma.vercel.app/api/attendance/mark'
+BACKEND_API = 'https://global-attendance-mqi3k4nbz-shivendras-projects-5911b529.vercel.app/api/attendance/mark'
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
