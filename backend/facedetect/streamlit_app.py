@@ -17,10 +17,12 @@ import os
 import csv
 import bcrypt
 import requests
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from pymongo import MongoClient
 from dotenv import load_dotenv
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
 
 # ── Core recognition from attendance.py ──────────────────────────────────────
 from attendance import (
@@ -199,6 +201,32 @@ def camera_worker(cam_id: str, source, gallery: dict,
     cap.release()
 
 
+# ── WebRTC Processor for Browser Webcam ─────────────────────────────────────────
+RTC_CONFIG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
+class FaceRecognitionTransformer(VideoProcessorBase):
+    def __init__(self, gallery, att_log, date_today):
+        self.gallery = gallery
+        self.att_log = att_log
+        self.date_today = date_today
+        self.detector = MTCNN()
+        self.confirm_buf = {}
+        self.period = 1 # Default
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        
+        # Process the frame using the core recognition logic
+        annotated = process_frame(
+            img, self.gallery, self.detector,
+            f"attendance_{self.date_today}.csv", 
+            set(self.att_log.keys()), 
+            self.date_today, self.period, self.confirm_buf
+        )
+        
+        from av import VideoFrame
+        return VideoFrame.from_ndarray(annotated, format="bgr24")
+
 def _text_frame(msg: str) -> np.ndarray:
     img = np.zeros((240, 480, 3), dtype=np.uint8)
     cv2.putText(img, msg, (10, 120),
@@ -302,11 +330,14 @@ with st.sidebar:
         duration   = col_d.number_input("Duration (min)", 0, 480, 60, help="0 = Unlimited")
 
         src_type = st.radio("Source Type",
-                            ["🎥 Webcam", "📡 RTSP / IP Camera", "📁 Video File"],
+                            ["🎥 Local Webcam", "🌐 Browser Webcam (Cloud)", "📡 RTSP", "📁 Video File"],
                             horizontal=True)
 
-        if src_type == "🎥 Webcam":
-            # Scan which webcam indices are actually available (0-4)
+        final_source = None
+        is_webrtc = False
+
+        if src_type == "🎥 Local Webcam":
+            st.info("Best for local deployment (uses PC camera)")
             @st.cache_data(show_spinner=False)
             def scan_webcams():
                 available = []
@@ -316,30 +347,32 @@ with st.sidebar:
                         available.append(i)
                         cap.release()
                 return available or [0]
-
             available_cams = scan_webcams()
-            cam_idx = st.selectbox(
-                "Select Webcam",
-                options=available_cams,
-                format_func=lambda i: f"Camera {i} {'(default)' if i == 0 else ''}"
-            )
-            final_source = cam_idx
+            final_source = st.selectbox("Select Webcam", available_cams)
 
-        elif src_type == "📡 RTSP / IP Camera":
-            rtsp_url = st.text_input(
-                "RTSP / HTTP URL",
-                placeholder="rtsp://admin:pass@192.168.1.100:554/ch01")
+        elif src_type == "🌐 Browser Webcam (Cloud)":
+            st.success("Best for Cloud (uses browser camera)")
+            is_webrtc = True
+            final_source = "webrtc"
+
+        elif src_type == "📡 RTSP":
+            rtsp_url = st.text_input("RTSP / HTTP URL", placeholder="rtsp://...")
             final_source = rtsp_url.strip()
 
         else:  # Video File
-            file_path = st.text_input(
-                "Video File Path",
-                placeholder="C:/videos/classroom.mp4")
-            final_source = file_path.strip()
+            uploaded_file = st.file_uploader("Upload Video", type=['mp4', 'avi', 'mov'])
+            if uploaded_file:
+                tfile = tempfile.NamedTemporaryFile(delete=False)
+                tfile.write(uploaded_file.read())
+                final_source = tfile.name
+                st.write(f"Loaded: {uploaded_file.name}")
+            else:
+                file_path = st.text_input("OR Local Path", placeholder="C:/videos/...")
+                final_source = file_path.strip()
 
         if st.button("Add Camera", width='stretch'):
             if not final_source and final_source != 0:
-                st.error("Please enter a valid source.")
+                st.error("Please provide a source.")
             else:
                 cam_id = f"cam_{len(st.session_state.cameras)+1}"
                 st.session_state.cameras[cam_id] = {
@@ -347,7 +380,7 @@ with st.sidebar:
                     "name":   cam_name or cam_id,
                     "period": period_num,
                     "duration": duration,
-                    "break": 10  # default break
+                    "is_webrtc": is_webrtc
                 }
                 st.success(f"✅ Added **{cam_name or cam_id}**")
                 st.rerun()
@@ -521,11 +554,27 @@ with tab_live:
 
         # Display current frames
         for cam_id, ph in placeholders.items():
-            frame = st.session_state.cam_frames.get(cam_id)
-            if frame is not None:
-                ph.image(frame, width='stretch')
+            info = st.session_state.cameras[cam_id]
+            
+            if info.get("is_webrtc"):
+                with ph:
+                    webrtc_streamer(
+                        key=cam_id,
+                        mode=WebRtcMode.SENDRECV,
+                        rtc_configuration=RTC_CONFIG,
+                        video_processor_factory=lambda: FaceRecognitionTransformer(
+                            st.session_state.gallery,
+                            st.session_state.attendance_log,
+                            st.session_state.date_today
+                        ),
+                        async_processing=True,
+                    )
             else:
-                ph.image(_text_frame("Not started"), width='stretch')
+                frame = st.session_state.cam_frames.get(cam_id)
+                if frame is not None:
+                    ph.image(frame, width='stretch')
+                else:
+                    ph.image(_text_frame("Not started"), width='stretch')
 
         if auto_refresh:
             time.sleep(2)
