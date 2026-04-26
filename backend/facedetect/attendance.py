@@ -333,6 +333,13 @@ def init_csv(date_today: str) -> str:
     return path
 
 
+def send_api_request(payload):
+    try:
+        r = requests.post(BACKEND_API, json=payload, timeout=10)
+        logging.info("API ✔" if r.status_code == 200 else f"API NACK: {r.text}")
+    except Exception as e:
+        logging.error(f"API error: {e}")
+
 def mark_attendance(roll: str, sim: float, date_today: str,
                     att_file: str, att_set: set, period: int):
     if roll in att_set:
@@ -343,14 +350,13 @@ def mark_attendance(roll: str, sim: float, date_today: str,
         csv.writer(f).writerow(
             [roll, date_today, ts, "present", f"Period {period}", f"{sim:.3f}"])
     logging.info(f"[PRESENT ] {roll:<20} Sim={sim:.3f}  P{period}")
-    try:
-        r = requests.post(BACKEND_API, json={
-            'rollNumber': roll, 'date': date_today,
-            'time': ts, 'status': 'present', 'classPeriod': period
-        }, timeout=10)
-        logging.info("API ✔" if r.status_code == 200 else f"API NACK: {r.text}")
-    except Exception as e:
-        logging.error(f"API error: {e}")
+    
+    payload = {
+        'rollNumber': roll, 'date': date_today,
+        'time': ts, 'status': 'present', 'classPeriod': period
+    }
+    import threading
+    threading.Thread(target=send_api_request, args=(payload,), daemon=True).start()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

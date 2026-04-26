@@ -182,13 +182,15 @@ def camera_worker(cam_id: str, source, gallery: dict,
                 att_log[roll] = {"time": ts, "sim": sim, "cam": cam_id}
                 reset_blink(confirm_buf, roll)
                 # Push to backend API
-                try:
-                    requests.post(BACKEND_API, json={
-                        "rollNumber": roll, "date": date_today,
-                        "time": ts, "status": "present", "classPeriod": period
-                    }, timeout=5)
-                except Exception:
-                    pass
+                def fire_api(r, d, t, p):
+                    try:
+                        requests.post(BACKEND_API, json={
+                            "rollNumber": r, "date": d,
+                            "time": t, "status": "present", "classPeriod": p
+                        }, timeout=5)
+                    except Exception:
+                        pass
+                threading.Thread(target=fire_api, args=(roll, date_today, ts, period), daemon=True).start()
 
             cv2.rectangle(frame, (L,T), (R,B), color, 2)
             cv2.putText(frame, label, (L, T-6),
@@ -221,20 +223,35 @@ class FaceRecognitionTransformer(VideoProcessorBase):
         self.period = 1 
         self.frame_count = 0  # Added counter for frame skipping
         self.last_annotated = None # Store last result
+        self.att_set = set(att_log.keys())
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
+        
+        if self.period == -1:
+            cv2.putText(img, "BREAK TIME", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            from av import VideoFrame
+            return VideoFrame.from_ndarray(img, format="bgr24")
+            
         self.frame_count += 1
         
         # Only run recognition every 5 frames
         if self.frame_count % 5 == 0 or self.last_annotated is None:
+            old_set_len = len(self.att_set)
             # Process the frame using the core recognition logic
             self.last_annotated = process_frame(
                 img, self.gallery, self.detector,
                 f"attendance_{self.date_today}.csv", 
-                set(self.att_log.keys()), 
+                self.att_set, 
                 self.date_today, self.period, self.confirm_buf
             )
+            
+            # Update the dashboard's attendance log if a new face was marked
+            if len(self.att_set) > old_set_len:
+                ts = datetime.now().strftime("%H:%M:%S")
+                for r in self.att_set:
+                    if r not in self.att_log:
+                        self.att_log[r] = {"time": ts, "sim": 0.0, "cam": "webrtc"}
         
         from av import VideoFrame
         # Return the annotated frame (or the last one we had to keep video moving)
@@ -428,6 +445,20 @@ with st.sidebar:
                     "source": cam_info["source"]
                 })
                 st.success("Added to schedule")
+                
+            if st.button("🔄 Auto-Generate Full Day (Periods 1-6)"):
+                cam_info = st.session_state.cameras[sel_cam]
+                for p in range(1, 7):
+                    st.session_state.schedule.append({
+                        "cam_id": sel_cam,
+                        "name": f"{cam_info['name']} - P{p}",
+                        "period": p,
+                        "duration": cam_info["duration"],
+                        "break": brk,
+                        "source": cam_info["source"]
+                    })
+                st.success("Added Periods 1-6 to schedule!")
+                st.rerun()
 
         if st.session_state.schedule:
             for i, item in enumerate(st.session_state.schedule):
@@ -508,19 +539,21 @@ if st.session_state.sched_active:
         elapsed = time.time() - st.session_state.sched_start_ts
         
         if st.session_state.sched_mode == "class":
-            # Start camera if not running
-            if cam_id not in st.session_state.cam_threads or not st.session_state.cam_threads[cam_id].is_alive():
-                stop_ev = threading.Event()
-                st.session_state.cam_stop[cam_id] = stop_ev
-                t = threading.Thread(
-                    target=camera_worker,
-                    args=(cam_id, item["source"], st.session_state.gallery, 
-                          st.session_state.cam_frames, stop_ev, 
-                          st.session_state.attendance_log, st.session_state.date_today, 
-                          item["period"], item["duration"]),
-                    daemon=True)
-                t.start()
-                st.session_state.cam_threads[cam_id] = t
+            cam_info = st.session_state.cameras.get(cam_id, {})
+            # Start camera if not running and not webrtc
+            if not cam_info.get("is_webrtc"):
+                if cam_id not in st.session_state.cam_threads or not st.session_state.cam_threads[cam_id].is_alive():
+                    stop_ev = threading.Event()
+                    st.session_state.cam_stop[cam_id] = stop_ev
+                    t = threading.Thread(
+                        target=camera_worker,
+                        args=(cam_id, item["source"], st.session_state.gallery, 
+                              st.session_state.cam_frames, stop_ev, 
+                              st.session_state.attendance_log, st.session_state.date_today, 
+                              item["period"], item["duration"]),
+                        daemon=True)
+                    t.start()
+                    st.session_state.cam_threads[cam_id] = t
             
             if elapsed >= item["duration"] * 60:
                 # Class over -> Start Break
@@ -583,7 +616,7 @@ with tab_live:
                 current_date    = st.session_state.date_today
                 
                 with ph:
-                    webrtc_streamer(
+                    webrtc_ctx = webrtc_streamer(
                         key=cam_id,
                         mode=WebRtcMode.SENDRECV,
                         rtc_configuration=RTC_CONFIG,
@@ -594,6 +627,16 @@ with tab_live:
                         ),
                         async_processing=True,
                     )
+                    
+                    if webrtc_ctx.video_processor:
+                        target_period = info["period"]
+                        if st.session_state.sched_active:
+                            idx = st.session_state.sched_idx
+                            if idx < len(st.session_state.schedule):
+                                item = st.session_state.schedule[idx]
+                                if item["cam_id"] == cam_id:
+                                    target_period = item["period"] if st.session_state.sched_mode == "class" else -1
+                        webrtc_ctx.video_processor.period = target_period
             else:
                 frame = st.session_state.cam_frames.get(cam_id)
                 if frame is not None:
