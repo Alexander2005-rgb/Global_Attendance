@@ -31,6 +31,17 @@ from mtcnn import MTCNN
 from deepface import DeepFace
 from scipy.spatial.distance import cosine as cosine_distance
 
+def warmup_models():
+    """Pre-load Keras models into memory to prevent timeouts during real-time processing."""
+    logging.info("Warming up DeepFace ensemble models...")
+    dummy = np.zeros((112, 112, 3), dtype=np.uint8)
+    for model in ["ArcFace", "Facenet512"]:
+        try:
+            DeepFace.represent(img_path=dummy, model_name=model, enforce_detection=False, detector_backend="skip")
+        except Exception:
+            pass
+    logging.info("Model warmup complete.")
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -329,7 +340,7 @@ def init_csv(date_today: str) -> str:
     if not os.path.exists(path):
         with open(path, "w", newline="") as f:
             csv.writer(f).writerow(
-                ["RollNumber", "Date", "Time", "Status", "Period", "Similarity"])
+                ["RollNumber", "Date", "Time", "Status", "Period", "Classroom", "Branch"])
     return path
 
 
@@ -341,19 +352,20 @@ def send_api_request(payload):
         logging.error(f"API error: {e}")
 
 def mark_attendance(roll: str, sim: float, date_today: str,
-                    att_file: str, att_set: set, period: int):
+                    att_file: str, att_set: set, period: int, classroom: str, branch: str):
     if roll in att_set:
         return
     att_set.add(roll)
     ts = datetime.now().strftime("%H:%M:%S")
     with open(att_file, "a", newline="") as f:
         csv.writer(f).writerow(
-            [roll, date_today, ts, "present", f"Period {period}", f"{sim:.3f}"])
-    logging.info(f"[PRESENT ] {roll:<20} Sim={sim:.3f}  P{period}")
+            [roll, date_today, ts, "present", f"Period {period}", classroom, branch])
+    logging.info(f"[PRESENT ] {roll:<20} Class={classroom} Branch={branch} P{period}")
     
     payload = {
         'rollNumber': roll, 'date': date_today,
-        'time': ts, 'status': 'present', 'classPeriod': period
+        'time': ts, 'status': 'present', 'classPeriod': period,
+        'classroom': classroom, 'branch': branch
     }
     import threading
     threading.Thread(target=send_api_request, args=(payload,), daemon=True).start()
@@ -379,7 +391,7 @@ def save_manifest(p: Path, s: set):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 def process_frame(frame, gallery: dict, detector: MTCNN,
-                  att_file, att_set, date_today, period, confirm_buf):
+                  att_file, att_set, date_today, period, confirm_buf, classroom: str, branch: str):
     small = cv2.resize(frame, (0, 0), fx=FRAME_SCALE_FACTOR, fy=FRAME_SCALE_FACTOR)
     rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
     s     = FRAME_SCALE_FACTOR
@@ -445,7 +457,7 @@ def process_frame(frame, gallery: dict, detector: MTCNN,
             label = f"{roll}  Sim={sim:.2f}  ({frames_done}/{CONFIRM_FRAMES})"
 
         if ready:
-            mark_attendance(roll, sim, date_today, att_file, att_set, period)
+            mark_attendance(roll, sim, date_today, att_file, att_set, period, classroom, branch)
             reset_blink(confirm_buf, roll)
 
         cv2.rectangle(frame, (L,T), (R,B), color, 2)

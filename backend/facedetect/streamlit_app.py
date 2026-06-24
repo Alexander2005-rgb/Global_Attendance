@@ -18,6 +18,15 @@ import csv
 import bcrypt
 import requests
 import tempfile
+import asyncio
+import sys
+
+# Fix aiortc/aioice UDP socket closure errors on Windows
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 from pathlib import Path
 from datetime import datetime
 from pymongo import MongoClient
@@ -33,15 +42,18 @@ from attendance import (
     MTCNN_DETECT_CONF, MTCNN_MIN_FACE, LIVENESS_ENABLED,
     BLINK_REQUIRED, SIM_THRESHOLD, ENSEMBLE_MODELS,
     BACKEND_API, build_gallery_from_mongo, get_db_students,
-    load_manifest, save_manifest,
+    load_manifest, save_manifest, warmup_models
 )
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Inject Streamlit secrets into environment variables for attendance.py
-if "MONGO_URI" in st.secrets:
-    for key in ["MONGO_URI", "MONGO_DB_NAME", "MONGO_USERS_COLLECTION"]:
-        if key in st.secrets:
-            os.environ[key] = st.secrets[key]
+try:
+    if "MONGO_URI" in st.secrets:
+        for key in ["MONGO_URI", "MONGO_DB_NAME", "MONGO_USERS_COLLECTION"]:
+            if key in st.secrets:
+                os.environ[key] = st.secrets[key]
+except Exception:
+    pass
 
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 if ENV_PATH.exists():
@@ -86,18 +98,16 @@ ss("cam_stop",         {})        # {cam_id: threading.Event}
 ss("attendance_log",   {})        # {roll: {"name":, "time":, "sim":, "cam":}}
 ss("detector",         None)
 ss("date_today",       datetime.now().strftime("%Y-%m-%d"))
-ss("schedule",         [])        # [{"name":, "period":, "duration":, "break":, "source":}]
+ss("schedules",        {})        # {cam_id: {"items": [], "idx": 0, "mode": "class", "start_ts": 0}}
 ss("sched_active",     False)
-ss("sched_idx",        0)         # current class index
-ss("sched_mode",       "class")   # "class" or "break"
-ss("sched_start_ts",   0)         # unix timestamp when current mode started
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMERA WORKER THREAD
 # ─────────────────────────────────────────────────────────────────────────────
 def camera_worker(cam_id: str, source, gallery: dict,
                   frame_store: dict, stop_event: threading.Event,
-                  att_log: dict, date_today: str, period: int, duration: int):
+                  att_log: dict, date_today: str, period: int, duration: int,
+                  classroom: str, branch: str):
     """Runs in a background thread. Reads frames, annotates, stores latest."""
     start_time = time.time()
     duration_secs = duration * 60 if duration > 0 else None
@@ -110,7 +120,7 @@ def camera_worker(cam_id: str, source, gallery: dict,
     if not os.path.exists(att_file):
         with open(att_file, "w", newline="") as f:
             csv.writer(f).writerow(
-                ["RollNumber","Date","Time","Status","Period","Similarity","Camera"])
+                ["RollNumber","Date","Time","Status","Period","Classroom","Branch"])
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -178,19 +188,20 @@ def camera_worker(cam_id: str, source, gallery: dict,
                 ts = datetime.now().strftime("%H:%M:%S")
                 with open(att_file, "a", newline="") as f:
                     csv.writer(f).writerow(
-                        [roll, date_today, ts, "present", f"P{period}", f"{sim:.3f}", cam_id])
-                att_log[roll] = {"time": ts, "sim": sim, "cam": cam_id}
+                        [roll, date_today, ts, "present", f"P{period}", classroom, branch])
+                att_log[roll] = {"time": ts, "sim": sim, "cam": cam_id, "classroom": classroom, "branch": branch}
                 reset_blink(confirm_buf, roll)
                 # Push to backend API
-                def fire_api(r, d, t, p):
+                def fire_api(r, d, t, p, c, b):
                     try:
                         requests.post(BACKEND_API, json={
                             "rollNumber": r, "date": d,
-                            "time": t, "status": "present", "classPeriod": p
+                            "time": t, "status": "present", "classPeriod": p,
+                            "classroom": c, "branch": b
                         }, timeout=5)
                     except Exception:
                         pass
-                threading.Thread(target=fire_api, args=(roll, date_today, ts, period), daemon=True).start()
+                threading.Thread(target=fire_api, args=(roll, date_today, ts, period, classroom, branch), daemon=True).start()
 
             cv2.rectangle(frame, (L,T), (R,B), color, 2)
             cv2.putText(frame, label, (L, T-6),
@@ -221,6 +232,8 @@ class FaceRecognitionTransformer(VideoProcessorBase):
         self.detector = MTCNN()
         self.confirm_buf = {}
         self.period = 1 
+        self.classroom = "N/A"
+        self.branch = "N/A"
         self.frame_count = 0  # Added counter for frame skipping
         self.last_annotated = None # Store last result
         self.att_set = set(att_log.keys())
@@ -243,7 +256,7 @@ class FaceRecognitionTransformer(VideoProcessorBase):
                 img, self.gallery, self.detector,
                 f"attendance_{self.date_today}.csv", 
                 self.att_set, 
-                self.date_today, self.period, self.confirm_buf
+                self.date_today, self.period, self.confirm_buf, self.classroom, self.branch
             )
             
             # Update the dashboard's attendance log if a new face was marked
@@ -251,7 +264,7 @@ class FaceRecognitionTransformer(VideoProcessorBase):
                 ts = datetime.now().strftime("%H:%M:%S")
                 for r in self.att_set:
                     if r not in self.att_log:
-                        self.att_log[r] = {"time": ts, "sim": 0.0, "cam": "webrtc"}
+                        self.att_log[r] = {"time": ts, "sim": 0.0, "cam": "webrtc", "classroom": self.classroom, "branch": self.branch}
         
         from av import VideoFrame
         # Return the annotated frame (or the last one we had to keep video moving)
@@ -336,6 +349,7 @@ with st.sidebar:
                         st.session_state.exam_cell_id)
                     save_manifest(manifest_path, db_s)
                     st.session_state.gallery = gall
+                    warmup_models()  # Pre-load AI weights so stream doesn't crash
                     st.success(f"Gallery ready: {len(gall)} students")
                 else:
                     st.error("No embeddings – check student photos in DB.")
@@ -344,8 +358,10 @@ with st.sidebar:
 
     if col2.button("Load Gallery"):
         if gallery_path.exists():
-            st.session_state.gallery = pickle.load(open(gallery_path, "rb"))
-            st.success(f"Loaded: {len(st.session_state.gallery)} students")
+            with st.spinner("Loading AI weights and gallery..."):
+                st.session_state.gallery = pickle.load(open(gallery_path, "rb"))
+                warmup_models()  # Pre-load AI weights so stream doesn't crash
+                st.success(f"Loaded: {len(st.session_state.gallery)} students")
         else:
             st.error("No gallery file found.")
 
@@ -354,10 +370,8 @@ with st.sidebar:
     # ── CAMERA MANAGEMENT ─────────────────────────────────────────────────────
     st.subheader("📷 Cameras")
     with st.expander("➕ Add Camera"):
-        cam_name   = st.text_input("Camera Name", placeholder="Classroom A")
-        col_p, col_d = st.columns(2)
-        period_num = col_p.number_input("Class Period", 1, 6, 1)
-        duration   = col_d.number_input("Duration (min)", 0, 480, 60, help="0 = Unlimited")
+        cam_name      = st.text_input("Camera Name", placeholder="Camera A")
+        classroom_num = st.text_input("Classroom Number", placeholder="e.g. 101, Lab 3")
 
         src_type = st.radio("Source Type",
                             ["🎥 Local Webcam", "🌐 Browser Webcam (Cloud)", "📡 RTSP", "📁 Video File"],
@@ -415,11 +429,12 @@ with st.sidebar:
                 st.session_state.cameras[cam_id] = {
                     "source": final_source,
                     "name":   cam_name or cam_id,
-                    "period": period_num,
-                    "duration": duration,
+                    "classroom": classroom_num or "N/A",
+                    "period": 1,        # Default for manual start
+                    "duration": 60,     # Default for manual start
                     "is_webrtc": is_webrtc
                 }
-                st.success(f"✅ Added **{cam_name or cam_id}**")
+                st.success(f"✅ Added **{cam_name or cam_id}** for Classroom **{classroom_num or 'N/A'}**")
                 st.rerun()
 
     # ── SCHEDULER ─────────────────────────────────────────────────────────────
@@ -429,59 +444,52 @@ with st.sidebar:
     if not st.session_state.cameras:
         st.info("Add at least one camera source first.")
     else:
-        with st.expander("📝 Build Schedule"):
-            sel_cam = st.selectbox("Select Class/Cam", 
-                                   options=list(st.session_state.cameras.keys()),
-                                   format_func=lambda k: st.session_state.cameras[k]["name"])
-            brk = st.number_input("Break after (min)", 0, 60, 10)
-            if st.button("➕ Add to Schedule"):
-                cam_info = st.session_state.cameras[sel_cam]
-                st.session_state.schedule.append({
-                    "cam_id": sel_cam,
-                    "name": cam_info["name"],
-                    "period": cam_info["period"],
-                    "duration": cam_info["duration"],
-                    "break": brk,
-                    "source": cam_info["source"]
-                })
-                st.success("Added to schedule")
+        with st.expander("📝 Full Day Planner (Periods 1-6)"):
+            with st.form("full_day_planner"):
+                st.markdown("Configure each period (Duration and Break in minutes). This applies to **ALL** cameras.")
                 
-            if st.button("🔄 Auto-Generate Full Day (Periods 1-6)"):
-                cam_info = st.session_state.cameras[sel_cam]
+                period_inputs = []
                 for p in range(1, 7):
-                    st.session_state.schedule.append({
-                        "cam_id": sel_cam,
-                        "name": f"{cam_info['name']} - P{p}",
-                        "period": p,
-                        "duration": cam_info["duration"],
-                        "break": brk,
-                        "source": cam_info["source"]
-                    })
-                st.success("Added Periods 1-6 to schedule!")
-                st.rerun()
-
-        if st.session_state.schedule:
-            for i, item in enumerate(st.session_state.schedule):
-                c1, c2 = st.columns([4,1])
-                c1.write(f"{i+1}. **{item['name']}** (P{item['period']}, {item['duration']}m + {item['break']}m)")
-                if c2.button("❌", key=f"del_sch_{i}"):
-                    st.session_state.schedule.pop(i)
-                    st.rerun()
-
-            if not st.session_state.sched_active:
-                if st.button("🚀 Start Auto-Schedule", type="primary", width='stretch'):
+                    cols = st.columns([1, 2, 1, 1])
+                    cols[0].markdown(f"**Period {p}**")
+                    b_name = cols[1].text_input(f"Branch", key=f"branch_{p}", placeholder="e.g. AIML")
+                    p_dur  = cols[2].number_input(f"Duration", key=f"dur_{p}", min_value=1, max_value=240, value=60)
+                    p_brk  = cols[3].number_input(f"Break After", key=f"brk_{p}", min_value=0, max_value=120, value=10)
+                    period_inputs.append((b_name, p_dur, p_brk))
+                
+                if st.form_submit_button("✅ Generate & Start All Cameras", use_container_width=True):
+                    now_ts = time.time()
+                    for c_id, cam_info in st.session_state.cameras.items():
+                        if c_id not in st.session_state.schedules:
+                            st.session_state.schedules[c_id] = {"items": [], "idx": 0, "mode": "class", "start_ts": now_ts}
+                        else:
+                            st.session_state.schedules[c_id]["start_ts"] = now_ts
+                            st.session_state.schedules[c_id]["idx"] = 0
+                            st.session_state.schedules[c_id]["mode"] = "class"
+                        
+                        st.session_state.schedules[c_id]["items"] = []
+                        for p in range(1, 7):
+                            b_name, p_dur, p_brk = period_inputs[p-1]
+                            st.session_state.schedules[c_id]["items"].append({
+                                "cam_id": c_id,
+                                "name": f"{cam_info['name']} - P{p}",
+                                "classroom": cam_info.get("classroom", "N/A"),
+                                "branch": b_name or "N/A",
+                                "period": p,
+                                "duration": p_dur,
+                                "break": p_brk,
+                                "source": cam_info["source"]
+                            })
                     st.session_state.sched_active = True
-                    st.session_state.sched_idx = 0
-                    st.session_state.sched_mode = "class"
-                    st.session_state.sched_start_ts = time.time()
+                    st.success("Schedules generated and started for all cameras!")
                     st.rerun()
-            else:
-                if st.button("🛑 Stop Scheduler", type="primary", width='stretch'):
-                    st.session_state.sched_active = False
-                    # Also stop active camera
-                    for cam_id in st.session_state.cam_stop:
-                        st.session_state.cam_stop[cam_id].set()
-                    st.rerun()
+
+        if st.session_state.sched_active:
+            if st.button("🛑 Stop All Schedulers", type="primary", width='stretch'):
+                st.session_state.sched_active = False
+                for cam_id in st.session_state.cam_stop:
+                    st.session_state.cam_stop[cam_id].set()
+                st.rerun()
 
     # List cameras with start/stop
     for cam_id, info in list(st.session_state.cameras.items()):
@@ -489,7 +497,7 @@ with st.sidebar:
                   st.session_state.cam_threads[cam_id].is_alive()
         status_icon = "🟢" if running else "🔴"
         c1, c2, c3 = st.columns([3,1,1])
-        c1.markdown(f"{status_icon} **{info['name']}** (P{info['period']}, {info['duration']}m)")
+        c1.markdown(f"{status_icon} **{info['name']}**")
 
         if not running:
             if c2.button("▶", key=f"start_{cam_id}"):
@@ -508,7 +516,9 @@ with st.sidebar:
                               st.session_state.attendance_log,
                               st.session_state.date_today,
                               info["period"],
-                              info["duration"]),
+                              info["duration"],
+                              info.get("classroom", "N/A"),
+                              "N/A"), # Manual start uses N/A branch
                         daemon=True)
                     t.start()
                     st.session_state.cam_threads[cam_id] = t
@@ -532,58 +542,66 @@ st.title("🎓 Multi-Camera Attendance Dashboard")
 
 # ── SCHEDULER LOGIC ──────────────────────────────────────────────────────────
 if st.session_state.sched_active:
-    idx = st.session_state.sched_idx
-    if idx < len(st.session_state.schedule):
-        item = st.session_state.schedule[idx]
-        cam_id = item["cam_id"]
-        elapsed = time.time() - st.session_state.sched_start_ts
-        
-        if st.session_state.sched_mode == "class":
-            cam_info = st.session_state.cameras.get(cam_id, {})
-            # Start camera if not running and not webrtc
-            if not cam_info.get("is_webrtc"):
-                if cam_id not in st.session_state.cam_threads or not st.session_state.cam_threads[cam_id].is_alive():
-                    stop_ev = threading.Event()
-                    st.session_state.cam_stop[cam_id] = stop_ev
-                    t = threading.Thread(
-                        target=camera_worker,
-                        args=(cam_id, item["source"], st.session_state.gallery, 
-                              st.session_state.cam_frames, stop_ev, 
-                              st.session_state.attendance_log, st.session_state.date_today, 
-                              item["period"], item["duration"]),
-                        daemon=True)
-                    t.start()
-                    st.session_state.cam_threads[cam_id] = t
+    all_done = True
+    for cam_id, sched in st.session_state.schedules.items():
+        idx = sched["idx"]
+        if idx < len(sched["items"]):
+            all_done = False
+            item = sched["items"][idx]
+            elapsed = time.time() - sched["start_ts"]
             
-            if elapsed >= item["duration"] * 60:
-                # Class over -> Start Break
-                st.session_state.cam_stop[cam_id].set()
-                st.session_state.sched_mode = "break"
-                st.session_state.sched_start_ts = time.time()
-                st.rerun()
+            if sched["mode"] == "class":
+                cam_info = st.session_state.cameras.get(cam_id, {})
+                # Start camera if not running and not webrtc
+                if not cam_info.get("is_webrtc"):
+                    if cam_id not in st.session_state.cam_threads or not st.session_state.cam_threads[cam_id].is_alive():
+                        stop_ev = threading.Event()
+                        st.session_state.cam_stop[cam_id] = stop_ev
+                        t = threading.Thread(
+                            target=camera_worker,
+                            args=(cam_id, item["source"], st.session_state.gallery, 
+                                  st.session_state.cam_frames, stop_ev, 
+                                  st.session_state.attendance_log, st.session_state.date_today, 
+                                  item["period"], item["duration"], item.get("classroom", "N/A"), item.get("branch", "N/A")),
+                            daemon=True)
+                        t.start()
+                        st.session_state.cam_threads[cam_id] = t
                 
-        elif st.session_state.sched_mode == "break":
-            if elapsed >= item["break"] * 60:
-                # Break over -> Next Class
-                st.session_state.sched_idx += 1
-                st.session_state.sched_mode = "class"
-                st.session_state.sched_start_ts = time.time()
-                st.rerun()
-    else:
+                if elapsed >= item["duration"] * 60:
+                    # Class over -> Start Break
+                    if cam_id in st.session_state.cam_stop:
+                        st.session_state.cam_stop[cam_id].set()
+                    sched["mode"] = "break"
+                    sched["start_ts"] = time.time()
+                    st.rerun()
+                    
+            elif sched["mode"] == "break":
+                if elapsed >= item["break"] * 60:
+                    # Break over -> Next Class
+                    sched["idx"] += 1
+                    sched["mode"] = "class"
+                    sched["start_ts"] = time.time()
+                    st.rerun()
+                    
+    if all_done and len(st.session_state.schedules) > 0:
         st.session_state.sched_active = False
         st.balloons()
-        st.success("All scheduled classes completed!")
+        st.success("All scheduled classes completed for all cameras!")
 
 # ── DASHBOARD UI ─────────────────────────────────────────────────────────────
 if st.session_state.sched_active:
-    item = st.session_state.schedule[st.session_state.sched_idx]
-    elapsed = int(time.time() - st.session_state.sched_start_ts)
-    if st.session_state.sched_mode == "class":
-        rem = max(0, item["duration"] * 60 - elapsed)
-        st.warning(f"🚀 **ACTIVE SCHEDULE:** Class **{item['name']}** in progress. Ends in {rem//60:02d}:{rem%60:02d}")
-    else:
-        rem = max(0, item["break"] * 60 - elapsed)
-        st.info(f"☕ **BREAK TIME:** Next class: **{st.session_state.schedule[st.session_state.sched_idx+1]['name'] if st.session_state.sched_idx+1 < len(st.session_state.schedule) else 'None'}**. Resuming in {rem//60:02d}:{rem%60:02d}")
+    with st.container():
+        for cam_id, sched in st.session_state.schedules.items():
+            if sched["idx"] < len(sched["items"]):
+                item = sched["items"][sched["idx"]]
+                elapsed = int(time.time() - sched["start_ts"])
+                if sched["mode"] == "class":
+                    rem = max(0, item["duration"] * 60 - elapsed)
+                    st.warning(f"📷 **{item['name']}** in progress. Ends in {rem//60:02d}:{rem%60:02d}")
+                else:
+                    rem = max(0, item["break"] * 60 - elapsed)
+                    next_name = sched["items"][sched["idx"]+1]["name"] if sched["idx"]+1 < len(sched["items"]) else "None"
+                    st.info(f"☕ **{item['cam_id']} BREAK TIME:** Next: **{next_name}**. Resuming in {rem//60:02d}:{rem%60:02d}")
 
 tab_live, tab_attend, tab_settings = st.tabs(
     ["📹 Live Feeds", "📋 Attendance Board", "⚙️ Settings"])
@@ -630,13 +648,18 @@ with tab_live:
                     
                     if webrtc_ctx.video_processor:
                         target_period = info["period"]
-                        if st.session_state.sched_active:
-                            idx = st.session_state.sched_idx
-                            if idx < len(st.session_state.schedule):
-                                item = st.session_state.schedule[idx]
-                                if item["cam_id"] == cam_id:
-                                    target_period = item["period"] if st.session_state.sched_mode == "class" else -1
+                        target_class = info.get("classroom", "N/A")
+                        target_branch = "N/A"
+                        if st.session_state.sched_active and cam_id in st.session_state.schedules:
+                            sched = st.session_state.schedules[cam_id]
+                            if sched["idx"] < len(sched["items"]):
+                                item = sched["items"][sched["idx"]]
+                                target_period = item["period"] if sched["mode"] == "class" else -1
+                                target_class = item.get("classroom", "N/A")
+                                target_branch = item.get("branch", "N/A")
                         webrtc_ctx.video_processor.period = target_period
+                        webrtc_ctx.video_processor.classroom = target_class
+                        webrtc_ctx.video_processor.branch = target_branch
             else:
                 frame = st.session_state.cam_frames.get(cam_id)
                 if frame is not None:
@@ -651,39 +674,58 @@ with tab_live:
 # ── TAB 2: Attendance Board ────────────────────────────────────────────────────
 with tab_attend:
     st.subheader(f"📋 Today's Attendance — {st.session_state.date_today}")
-    log = st.session_state.attendance_log
+    
+    # Read from CSV directly as ground truth
+    import csv
+    import os
+    
+    rows = []
+    att_file = f"attendance_{st.session_state.date_today}.csv"
+    if os.path.exists(att_file):
+        with open(att_file, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            # Normalize headers because some old CSVs have "Similarity" instead of "Classroom"
+            for row in reader:
+                roll = row.get("RollNumber", "—")
+                time_str = row.get("Time", "—")
+                # Handle old vs new formats
+                classroom = row.get("Classroom") or row.get("Similarity", "—")
+                branch = row.get("Branch", "—")
+                cam = row.get("Camera") or "webrtc"
+                status = row.get("Status", "—")
+                
+                rows.append({
+                    "Roll Number": roll,
+                    "Time":        time_str,
+                    "Classroom":   classroom,
+                    "Branch":      branch,
+                    "Camera":      cam,
+                    "Status":      "✅ Present" if status == "present" else status
+                })
 
-    if not log:
-        st.info("No attendance marked yet.")
+    if not rows:
+        st.info("No attendance marked yet in the CSV file.")
     else:
-        rows = []
-        for roll, data in sorted(log.items()):
-            rows.append({
-                "Roll Number": roll,
-                "Time":        data.get("time","—"),
-                "Similarity":  f"{data.get('sim',0):.3f}",
-                "Camera":      data.get("cam","—"),
-                "Status":      "✅ Present"
-            })
         st.dataframe(rows, width='stretch')
-        st.metric("Total Present", len(log))
+        st.metric("Total Present", len(rows))
 
     if st.button("🔄 Refresh Board"):
         st.rerun()
 
     # Download CSV
-    if log:
+    if rows:
         import io
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["Roll Number", "Time", "Similarity", "Camera", "Status"])
-        for roll, data in sorted(log.items()):
+        writer.writerow(["Roll Number", "Time", "Classroom", "Branch", "Camera", "Status"])
+        for r in rows:
             writer.writerow([
-                roll, 
-                data.get("time", ""), 
-                f"{data.get('sim', 0):.3f}", 
-                data.get("cam", ""), 
-                "present"
+                r["Roll Number"], 
+                r["Time"], 
+                r["Classroom"],
+                r["Branch"],
+                r["Camera"], 
+                r["Status"]
             ])
         csv_data = output.getvalue()
         
