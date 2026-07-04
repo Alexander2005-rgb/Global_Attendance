@@ -14,7 +14,9 @@ async function createUsers() {
     const users = [
       // { name: 'Jane Smith', email: 'faculty@example.com', password: 'password123', role: 'faculty' },
       { name: 'shivendra', email: 'shivendra@gmail.com', password: 'shiv@2005', role: 'exam cell' },
-      { name: 'Ayushman', email: 'ayushman@gmail.com', password: 'ayushman@2005', role: 'exam cell' }
+      { name: 'Ayushman', email: 'ayushman@gmail.com', password: 'ayushman@2005', role: 'exam cell' },
+      { name: 'Anuj', email: 'anuj@gmail.com', password: 'anuj@2005', role: 'exam cell' },
+      { name: 'Arth', email: 'arth@gmail.com', password: 'arth@2005', role: 'exam cell' }
       // Sample Students for different years and classes
 
     ];
