@@ -603,7 +603,21 @@ def main():
                 cap.release()
                 cv2.destroyAllWindows()
 
-            logging.info(f"Period {class_period} done – {len(att_set)} present.")
+            absentees = set(gallery.keys()) - att_set
+            ts = datetime.now().strftime("%H:%M:%S")
+            with open(att_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                for roll in absentees:
+                    writer.writerow([roll, date_today, ts, "absent", f"Period {class_period}", "N/A", "N/A"])
+                    payload = {
+                        'rollNumber': roll, 'date': date_today,
+                        'time': ts, 'status': 'absent', 'classPeriod': class_period,
+                        'classroom': "N/A", 'branch': "N/A"
+                    }
+                    import threading
+                    threading.Thread(target=send_api_request, args=(payload,), daemon=True).start()
+
+            logging.info(f"Period {class_period} done – {len(att_set)} present, {len(absentees)} absent.")
             time.sleep(10)
             class_period += 1
 

@@ -20,6 +20,7 @@ import requests
 import tempfile
 import asyncio
 import sys
+import logging
 
 # Fix aiortc/aioice UDP socket closure errors on Windows
 if sys.platform.startswith("win"):
@@ -100,6 +101,73 @@ ss("detector",         None)
 ss("date_today",       datetime.now().strftime("%Y-%m-%d"))
 ss("schedules",        {})        # {cam_id: {"items": [], "idx": 0, "mode": "class", "start_ts": 0}}
 ss("sched_active",     False)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ABSENTEE & CSV HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def mark_absentees_for_period(date_today, period_str, classroom, branch, gallery):
+    if not gallery:
+        return
+    att_file = f"attendance_{date_today}.csv"
+    present_rolls = set()
+    if os.path.exists(att_file):
+        with open(att_file, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                row_period = str(row.get("Period", ""))
+                # Normalize period strings
+                if row_period == period_str or row_period.replace("Period ", "P") == period_str.replace("Period ", "P"):
+                    if row.get("Status", "").lower() == "present":
+                        present_rolls.add(row.get("RollNumber", ""))
+                        
+    absentees = set(gallery.keys()) - present_rolls
+    ts = datetime.now().strftime("%H:%M:%S")
+    
+    with open(att_file, "a", newline="") as f:
+        writer = csv.writer(f)
+        for roll in absentees:
+            writer.writerow([roll, date_today, ts, "absent", period_str, classroom, branch])
+            # Push to backend
+            try:
+                requests.post(BACKEND_API, json={
+                    "rollNumber": roll, "date": date_today,
+                    "time": ts, "status": "absent", 
+                    "classPeriod": period_str.replace("Period ", "").replace("P", ""),
+                    "classroom": classroom, "branch": branch
+                }, timeout=5)
+            except Exception:
+                pass
+
+def generate_final_csv(date_today):
+    att_file = f"attendance_{date_today}.csv"
+    final_file = f"final_attendance_{date_today}.csv"
+    if not os.path.exists(att_file): 
+        return
+        
+    from collections import defaultdict
+    data = defaultdict(dict)
+    periods = set()
+    
+    with open(att_file, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            roll = row.get("RollNumber", "")
+            if not roll: continue
+            period = str(row.get("Period", "")).replace("Period ", "P")
+            status = row.get("Status", "absent")
+            if data[roll].get(period) != "present":
+                data[roll][period] = status
+            periods.add(period)
+            
+    sorted_periods = sorted(list(periods))
+    with open(final_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["RollNumber"] + sorted_periods)
+        for roll, p_data in data.items():
+            row = [roll]
+            for p in sorted_periods:
+                row.append(p_data.get(p, "absent"))
+            writer.writerow(row)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMERA WORKER THREAD
@@ -229,7 +297,7 @@ class FaceRecognitionTransformer(VideoProcessorBase):
         self.gallery = gallery
         self.att_log = att_log
         self.date_today = date_today
-        self.detector = MTCNN()
+        self.detector = None  # Initialize lazily in recv to avoid cross-thread Keras issues
         self.confirm_buf = {}
         self.period = 1 
         self.classroom = "N/A"
@@ -238,7 +306,17 @@ class FaceRecognitionTransformer(VideoProcessorBase):
         self.last_annotated = None # Store last result
         self.att_set = set(att_log.keys())
 
+        # Ensure CSV header exists when WebRTC is the first to run today
+        att_file = f"attendance_{self.date_today}.csv"
+        if not os.path.exists(att_file):
+            with open(att_file, "w", newline="") as f:
+                csv.writer(f).writerow(
+                    ["RollNumber","Date","Time","Status","Period","Classroom","Branch"])
+
     def recv(self, frame):
+        if self.detector is None:
+            self.detector = MTCNN()
+            
         img = frame.to_ndarray(format="bgr24")
         
         if self.period == -1:
@@ -571,6 +649,13 @@ if st.session_state.sched_active:
                     # Class over -> Start Break
                     if cam_id in st.session_state.cam_stop:
                         st.session_state.cam_stop[cam_id].set()
+                    mark_absentees_for_period(
+                        st.session_state.date_today, 
+                        f"P{item['period']}", 
+                        item.get("classroom", "N/A"), 
+                        item.get("branch", "N/A"), 
+                        st.session_state.gallery
+                    )
                     sched["mode"] = "break"
                     sched["start_ts"] = time.time()
                     st.rerun()
@@ -585,8 +670,9 @@ if st.session_state.sched_active:
                     
     if all_done and len(st.session_state.schedules) > 0:
         st.session_state.sched_active = False
+        generate_final_csv(st.session_state.date_today)
         st.balloons()
-        st.success("All scheduled classes completed for all cameras!")
+        st.success("All scheduled classes completed for all cameras! Final CSV generated.")
 
 # ── DASHBOARD UI ─────────────────────────────────────────────────────────────
 if st.session_state.sched_active:
@@ -735,6 +821,19 @@ with tab_attend:
             file_name=f"attendance_{st.session_state.date_today}.csv",
             mime="text/csv",
             width='stretch'
+        )
+
+    final_file = f"final_attendance_{st.session_state.date_today}.csv"
+    if os.path.exists(final_file):
+        with open(final_file, "r", encoding="utf-8") as f:
+            final_csv_data = f.read()
+        st.download_button(
+            label="⬇ Download Final Period-Wise CSV",
+            data=final_csv_data,
+            file_name=final_file,
+            mime="text/csv",
+            type="primary",
+            use_container_width=True
         )
 
 # ── TAB 3: Settings ───────────────────────────────────────────────────────────
